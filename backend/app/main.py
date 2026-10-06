@@ -8,15 +8,54 @@ from .recommender import Recommender
 from .deepseek import explain_recommendation, interpret_preference
 
 app = FastAPI(title="Maple Movies API", version="1.0.0")
-app.add_middleware(CORSMiddleware, allow_origins=[settings.frontend_origin], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+
+# FRONTEND_ORIGIN may contain one origin or a comma-separated list of origins.
+# Keep credentials enabled because the frontend sends authenticated requests.
+allowed_origins = [
+    origin.strip()
+    for origin in settings.frontend_origin.split(",")
+    if origin.strip()
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 def auth_user(authorization: str | None = Header(default=None)):
+    """Resolve the authenticated Supabase user from the frontend access token.
+
+    Supabase performs the JWT verification, so the API does not make assumptions
+    about whether the project is currently signing tokens with RS256 or ES256.
+    This is the same important auth boundary used by the corrected deployment:
+    the API validates the token with Supabase rather than hard-coding a JWT
+    signing algorithm in application code.
+    """
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(401, "Please sign in first.")
+        raise HTTPException(status_code=401, detail="Please sign in first.")
+
+    token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Please sign in first.")
+
     try:
-        return current_user(authorization.split(" ",1)[1])
+        user = current_user(token)
+        if not user or not getattr(user, "id", None):
+            raise HTTPException(
+                status_code=401,
+                detail="Your session has expired. Please sign in again.",
+            )
+        return user
+    except HTTPException:
+        raise
     except Exception:
-        raise HTTPException(401, "Your session has expired. Please sign in again.")
+        raise HTTPException(
+            status_code=401,
+            detail="Your session has expired. Please sign in again.",
+        )
 
 def rows(table, columns="*"):
     return supabase.table(table).select(columns).execute().data

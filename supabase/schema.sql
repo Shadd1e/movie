@@ -21,7 +21,7 @@ create table if not exists public.movies (
   overview text,
   release_date date,
   genres text[] not null default '{}',
-  cast text[] not null default '{}',
+  "cast" text[] NOT NULL DEFAULT '{}'::text[],
   director text,
   keywords text[] not null default '{}',
   poster_path text,
