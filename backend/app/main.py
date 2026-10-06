@@ -9,17 +9,12 @@ from .deepseek import explain_recommendation, interpret_preference
 
 app = FastAPI(title="Maple Movies API", version="1.0.0")
 
-# FRONTEND_ORIGIN may contain one origin or a comma-separated list of origins.
-# Keep credentials enabled because the frontend sends authenticated requests.
-allowed_origins = [
-    origin.strip()
-    for origin in settings.frontend_origin.split(",")
-    if origin.strip()
-]
-
+# Vercel creates changing preview URLs, so allow any Vercel deployment
+# while keeping credentials enabled for authenticated frontend requests.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=[],
+    allow_origin_regex=r"https://.*\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
