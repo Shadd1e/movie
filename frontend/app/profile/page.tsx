@@ -1,0 +1,3 @@
+'use client'
+import {useEffect,useState} from 'react';import {supabase} from '../../lib/supabase'
+export default function Profile(){const [email,setEmail]=useState('');useEffect(()=>{supabase.auth.getUser().then(({data})=>setEmail(data.user?.email||''))},[]);async function logout(){await supabase.auth.signOut();location.href='/'}return <main className="form"><div className="eyebrow">Your account</div><h1>Profile</h1><p className="reason">{email}</p><p className="small">Your preferences and ratings are kept with your account so the recommendation list can change as your taste changes.</p><button className="button secondary" onClick={logout}>Sign out</button></main>}
