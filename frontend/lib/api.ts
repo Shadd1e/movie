@@ -1,33 +1,34 @@
-import { supabase } from "./supabase"
+import { supabase } from './supabase'
 
-const base = "/api/backend"
+const base = '/api/backend'
 
-export async function api(path: string, options: RequestInit = {}) {
-  const { data } = await supabase.auth.getSession()
+export async function api<T = any>(path: string, options: RequestInit = {}): Promise<T> {
+  const { data: sessionData, error: sessionError } = await supabase.auth.getSession()
+  if (sessionError) throw new Error('Your session could not be checked. Please sign in again.')
+
   const headers = new Headers(options.headers)
+  if (sessionData.session?.access_token) headers.set('Authorization', `Bearer ${sessionData.session.access_token}`)
+  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
 
-  if (data.session?.access_token) {
-    headers.set("Authorization", `Bearer ${data.session.access_token}`)
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`
+  let response: Response
+  try {
+    response = await fetch(`${base}${normalizedPath}`, { ...options, headers, cache: 'no-store' })
+  } catch {
+    throw new Error('We could not reach the Maple Movies service. Please try again shortly.')
   }
 
-  if (options.body && !headers.has("Content-Type")) {
-    headers.set("Content-Type", "application/json")
-  }
-
-  const normalizedPath = path.startsWith("/") ? path : `/${path}`
-
-  const response = await fetch(`${base}${normalizedPath}`, {
-    ...options,
-    headers,
-  })
+  const contentType = response.headers.get('content-type') || ''
+  const payload = contentType.includes('application/json')
+    ? await response.json().catch(() => ({}))
+    : await response.text().catch(() => '')
 
   if (!response.ok) {
-    const error = await response
-      .json()
-      .catch(() => ({ detail: "Something went wrong." }))
-
-    throw new Error(error.detail || "Something went wrong.")
+    const message = typeof payload === 'object' && payload
+      ? payload.detail || payload.message || 'Something went wrong. Please try again.'
+      : 'Something went wrong. Please try again.'
+    if (response.status === 401) throw new Error('Your session has expired. Please sign in again.')
+    throw new Error(String(message))
   }
-
-  return response.json()
+  return payload as T
 }
