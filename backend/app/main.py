@@ -174,14 +174,83 @@ def onboarding(payload: Onboarding, user=Depends(auth_user)):
     except Exception:
         raise HTTPException(status_code=503, detail="Your preferences could not be saved. Check the database configuration and try again.")
 
+def ensure_movie_exists(movie_id: int):
+    """Ensure a TMDB movie exists locally before a rating references it."""
+    existing = (
+        supabase.table("movies")
+        .select("id")
+        .eq("id", movie_id)
+        .maybe_single()
+        .execute()
+    )
+    if existing.data:
+        return
+
+    if not settings.tmdb_access_token:
+        raise HTTPException(
+            status_code=404,
+            detail="This movie is not in the catalogue and TMDB is not configured.",
+        )
+
+    try:
+        details = __import__("asyncio").run(movie_details(movie_id))
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="The movie could not be found in the movie catalogue.",
+        )
+
+    credits = details.get("credits", {})
+    row = {
+        "id": details.get("id"),
+        "title": details.get("title"),
+        "overview": details.get("overview"),
+        "release_date": details.get("release_date") or None,
+        "genres": [g["name"] for g in details.get("genres", []) if g.get("name")],
+        "cast": [x["name"] for x in credits.get("cast", [])[:8] if x.get("name")],
+        "director": next(
+            (x["name"] for x in credits.get("crew", [])
+             if x.get("job") == "Director" and x.get("name")),
+            None,
+        ),
+        "keywords": [
+            x["name"] for x in details.get("keywords", {}).get("keywords", [])[:20]
+            if x.get("name")
+        ],
+        "poster_path": details.get("poster_path"),
+        "source": "tmdb",
+    }
+    if not row["id"] or not row["title"]:
+        raise HTTPException(status_code=404, detail="The movie was not found on TMDB.")
+
+    try:
+        supabase.table("movies").upsert(row).execute()
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="The movie could not be saved to the catalogue. Please try again.",
+        )
+
+
 @app.post("/ratings")
 def rating(payload: Rating, user=Depends(auth_user)):
+    # ratings.movie_id has a foreign key to movies.id, so create the movie row
+    # before writing the rating when this is a TMDB movie not yet in Supabase.
+    ensure_movie_exists(payload.movie_id)
     data = {
         "user_id": str(user.id),
         "movie_id": payload.movie_id,
         "rating": payload.rating,
     }
-    supabase.table("ratings").upsert(data, on_conflict="user_id,movie_id").execute()
+    try:
+        supabase.table("ratings").upsert(
+            data, on_conflict="user_id,movie_id"
+        ).execute()
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Your rating could not be saved. Please try again.",
+        )
     return {"ok": True}
 
 @app.get("/recommendations")
