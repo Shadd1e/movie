@@ -174,166 +174,198 @@ def onboarding(payload: Onboarding, user=Depends(auth_user)):
     except Exception:
         raise HTTPException(status_code=503, detail="Your preferences could not be saved. Check the database configuration and try again.")
 
-def ensure_movie_exists(movie_id: int):
-    """Ensure a TMDB movie exists locally before a rating references it."""
-    existing = (
-        supabase.table("movies")
-        .select("id")
-        .eq("id", movie_id)
-        .maybe_single()
-        .execute()
-    )
-    if existing.data:
-        return
-
-    if not settings.tmdb_access_token:
-        raise HTTPException(
-            status_code=404,
-            detail="This movie is not in the catalogue and TMDB is not configured.",
-        )
-
-    try:
-        details = __import__("asyncio").run(movie_details(movie_id))
-    except Exception:
-        raise HTTPException(
-            status_code=404,
-            detail="The movie could not be found in the movie catalogue.",
-        )
-
-    credits = details.get("credits", {})
-    row = {
-        "id": details.get("id"),
-        "title": details.get("title"),
-        "overview": details.get("overview"),
-        "release_date": details.get("release_date") or None,
-        "genres": [g["name"] for g in details.get("genres", []) if g.get("name")],
-        "cast": [x["name"] for x in credits.get("cast", [])[:8] if x.get("name")],
-        "director": next(
-            (x["name"] for x in credits.get("crew", [])
-             if x.get("job") == "Director" and x.get("name")),
-            None,
-        ),
-        "keywords": [
-            x["name"] for x in details.get("keywords", {}).get("keywords", [])[:20]
-            if x.get("name")
-        ],
-        "poster_path": details.get("poster_path"),
-        "source": "tmdb",
-    }
-    if not row["id"] or not row["title"]:
-        raise HTTPException(status_code=404, detail="The movie was not found on TMDB.")
-
-    try:
-        supabase.table("movies").upsert(row).execute()
-    except Exception:
-        raise HTTPException(
-            status_code=503,
-            detail="The movie could not be saved to the catalogue. Please try again.",
-        )
-
-
 @app.post("/ratings")
 def rating(payload: Rating, user=Depends(auth_user)):
-    # ratings.movie_id has a foreign key to movies.id, so create the movie row
-    # before writing the rating when this is a TMDB movie not yet in Supabase.
-    ensure_movie_exists(payload.movie_id)
     data = {
         "user_id": str(user.id),
         "movie_id": payload.movie_id,
         "rating": payload.rating,
     }
-    try:
-        supabase.table("ratings").upsert(
-            data, on_conflict="user_id,movie_id"
-        ).execute()
-    except Exception:
-        raise HTTPException(
-            status_code=503,
-            detail="Your rating could not be saved. Please try again.",
-        )
+    supabase.table("ratings").upsert(data, on_conflict="user_id,movie_id").execute()
     return {"ok": True}
+
+def _normal_title(value: str) -> str:
+    """Normalize a title for matching DeepSeek candidates against TMDB results."""
+    import re
+    return re.sub(r"[^a-z0-9]+", "", (value or "").casefold())
+
+
+def _year_from_date(value):
+    try:
+        return int(str(value)[:4])
+    except (TypeError, ValueError):
+        return None
+
+
+def _tmdb_match(results: list[dict], title: str, release_year: int | None):
+    """Choose the closest title/year match instead of blindly taking the first search result."""
+    target = _normal_title(title)
+    if not target:
+        return None
+
+    def rank(item):
+        candidate_title = _normal_title(item.get("title") or item.get("original_title") or "")
+        candidate_year = _year_from_date(item.get("release_date"))
+        exact = candidate_title == target
+        related = target in candidate_title or candidate_title in target
+        year_match = release_year is not None and candidate_year == release_year
+        year_distance = abs(candidate_year - release_year) if release_year and candidate_year else 999
+        popularity = float(item.get("popularity") or 0)
+        return (int(exact), int(year_match), int(related), -year_distance, popularity)
+
+    valid = [x for x in results if x.get("id") and (x.get("title") or x.get("original_title"))]
+    if not valid:
+        return None
+    best = max(valid, key=rank)
+    best_title = _normal_title(best.get("title") or best.get("original_title") or "")
+    if best_title != target and target not in best_title and best_title not in target:
+        return None
+    return best
+
+
+async def _enrich_deepseek_candidate(candidate: dict) -> dict:
+    """Use TMDB as the source of truth for poster, release date, overview and credits."""
+    title = str(candidate.get("title") or "").strip()
+    if not title or not settings.tmdb_access_token:
+        return candidate
+
+    year = _year_from_date(candidate.get("release_date")) or candidate.get("release_year")
+    try:
+        search_data = await search_movies(title)
+        match = _tmdb_match(search_data.get("results", []), title, year)
+        if not match:
+            return candidate
+
+        details = await movie_details(int(match["id"]))
+        credits = details.get("credits") or {}
+        genres = [g.get("name") for g in details.get("genres", []) if g.get("name")]
+        cast = [x.get("name") for x in credits.get("cast", [])[:8] if x.get("name")]
+        director = next((x.get("name") for x in credits.get("crew", [])
+                         if x.get("job") == "Director" and x.get("name")), None)
+        keywords = [x.get("name") for x in (details.get("keywords") or {}).get("keywords", [])[:20]
+                    if x.get("name")]
+        enriched = {
+            "id": details.get("id"),
+            "title": details.get("title") or title,
+            "overview": details.get("overview") or candidate.get("overview"),
+            "release_date": details.get("release_date") or candidate.get("release_date"),
+            "genres": genres or candidate.get("genres", []),
+            "cast": cast,
+            "director": director,
+            "keywords": keywords,
+            "poster_path": details.get("poster_path"),
+            "source": "deepseek+tmdb",
+            "deepseek_reason": candidate.get("deepseek_reason"),
+        }
+        try:
+            supabase.table("movies").upsert({k: v for k, v in enriched.items() if k != "deepseek_reason"}).execute()
+        except Exception:
+            pass  # A cache-write failure must not break recommendations.
+        return enriched
+    except Exception:
+        return candidate  # Keep the DeepSeek candidate if TMDB is temporarily unavailable.
+
 
 @app.get("/recommendations")
 async def recommendations(user=Depends(auth_user)):
+    """Generate candidates with DeepSeek first, then enrich each candidate with TMDB."""
     uid = str(user.id)
-    profile = user_profile(uid)
+    try:
+        profile = user_profile(uid)
+    except Exception:
+        profile = {"genres": [], "favourite_movie_ids": [], "preferred_movie_years": []}
+
     genres = profile.get("genres", []) or []
     favourite_ids = profile.get("favourite_movie_ids", []) or []
     preferred_years = profile.get("preferred_movie_years", []) or []
+    try:
+        movies = rows("movies")
+    except Exception:
+        movies = []
+    try:
+        ratings = rows("ratings", "user_id,movie_id,rating")
+    except Exception:
+        ratings = []
 
-    movies = rows("movies")
-    ratings = rows("ratings", "user_id,movie_id,rating")
+    favourite_titles = [str(m["title"]) for m in movies
+                        if m.get("id") in favourite_ids and m.get("title")]
+    rated_ids = {str(r.get("movie_id")) for r in ratings
+                 if str(r.get("user_id")) == uid and r.get("movie_id") is not None}
+    rated_titles = [str(m["title"]) for m in movies
+                    if str(m.get("id")) in rated_ids and m.get("title")]
 
-    # Normal path: rank the local catalogue.
-    if movies:
-        engine = Recommender(movies, ratings)
-        recs = engine.recommend(uid, genres, favourite_ids, preferred_movie_years=preferred_years)
-        for i, r in enumerate(recs):
-            reason = await explain_recommendation(r["movie"], r["signals"]) if i < 5 else None
-            r["reason"] = reason or fallback_reason(r["movie"], r["signals"], genres)
-        if recs:
-            return {"source": "hybrid", "recommendations": recs}
-
-    # Emergency path: do not leave the recommendation screen empty. Ask DeepSeek
-    # for real movie candidates immediately, then enrich them from TMDB when possible.
-    favourite_titles = []
-    for movie_id in favourite_ids:
-        local = next((m for m in movies if m.get("id") == movie_id), None)
-        if local and local.get("title"):
-            favourite_titles.append(local["title"])
-
-    rated_ids = {r["movie_id"] for r in ratings if r["user_id"] == uid}
-    rated_titles = [m.get("title") for m in movies if m.get("id") in rated_ids and m.get("title")]
-    fallback = await recommend_movies_with_deepseek(
+    candidates = await recommend_movies_with_deepseek(
         genres, favourite_titles, rated_titles, limit=12,
         preferred_movie_years=preferred_years,
     )
+    source = "deepseek"
 
-    if fallback and settings.tmdb_access_token:
-        # Turn DeepSeek's titles into canonical TMDB movie records where possible.
-        enriched = []
-        for candidate in fallback:
-            try:
-                data = await search_movies(candidate["title"])
-                match = next((x for x in data.get("results", []) if x.get("id")), None)
-                if match:
-                    details = await movie_details(int(match["id"]))
-                    credits = details.get("credits", {})
-                    candidate.update({
-                        "id": details.get("id"),
-                        "title": details.get("title") or candidate["title"],
-                        "overview": details.get("overview") or candidate.get("overview"),
-                        "release_date": details.get("release_date") or candidate.get("release_date"),
-                        "genres": [g["name"] for g in details.get("genres", [])] or candidate.get("genres", []),
-                        "cast": [x["name"] for x in credits.get("cast", [])[:8]],
-                        "director": next((x["name"] for x in credits.get("crew", []) if x.get("job") == "Director"), None),
-                        "keywords": [x["name"] for x in details.get("keywords", {}).get("keywords", [])[:20]],
-                        "poster_path": details.get("poster_path"),
-                        "source": "deepseek+tmdb",
-                    })
-                    enriched.append(candidate)
-                    continue
-            except Exception:
-                pass
-            enriched.append(candidate)
-        fallback = enriched
+    # If DeepSeek is unavailable, retain the existing hybrid engine as a fallback.
+    if not candidates and movies:
+        try:
+            engine = Recommender(movies, ratings)
+            local_recs = engine.recommend(uid, genres, favourite_ids,
+                                          preferred_movie_years=preferred_years)
+            candidates = []
+            for item in local_recs[:12]:
+                movie_data = item.get("movie") or {}
+                signals = item.get("signals") or {"content_score": 0, "collaborative_score": 0}
+                candidates.append({
+                    **movie_data,
+                    "deepseek_reason": item.get("reason") or fallback_reason(movie_data, signals, genres),
+                    "_existing_score": item.get("score", 0),
+                    "_existing_signals": signals,
+                })
+            source = "hybrid_fallback"
+        except Exception:
+            candidates = []
 
-    # Keep the same response contract as the hybrid path: every recommendation
-    # has a `movie` object, a reason, a score, and signals.
+    if not candidates:
+        if not settings.deepseek_api_key:
+            raise HTTPException(status_code=503,
+                detail="Recommendations are unavailable because DEEPSEEK_API_KEY is not configured.")
+        raise HTTPException(status_code=502,
+            detail="The recommendation service returned no usable movies. Please try again.")
+
+    import asyncio
+    enriched = await asyncio.gather(
+        *(_enrich_deepseek_candidate(item) for item in candidates[:12]),
+        return_exceptions=True,
+    )
     normalized = []
-    for candidate in fallback:
-        reason = candidate.pop("deepseek_reason", None)
+    for index, result in enumerate(enriched):
+        candidate = candidates[index] if isinstance(result, Exception) else result
+        title = str(candidate.get("title") or "").strip()
+        if not title:
+            continue
+        reason = str(candidate.get("deepseek_reason") or "").strip()
         if not reason:
-            reason = (f"A strong match for your interest in {', '.join(genres[:2]).lower()}."
-                      if genres else "A movie worth exploring based on your current choices.")
+            reason = (f"A thoughtful match for your interest in {', '.join(genres[:2]).lower()}."
+                      if genres else "A movie selected to give you something worthwhile to explore.")
         normalized.append({
-            "movie": candidate,
+            "movie": {
+                "id": candidate.get("id"), "title": title,
+                "overview": candidate.get("overview"),
+                "release_date": candidate.get("release_date"),
+                "genres": candidate.get("genres") or [],
+                "cast": candidate.get("cast") or [],
+                "director": candidate.get("director"),
+                "keywords": candidate.get("keywords") or [],
+                "poster_path": candidate.get("poster_path"),
+                "source": candidate.get("source") or "deepseek",
+            },
             "reason": reason,
-            "score": 1.0,
-            "signals": {"source": "deepseek", "ratings_used": len(rated_ids)},
+            "score": candidate.get("_existing_score", max(0.5, 1.0 - index * 0.025)),
+            "signals": candidate.get("_existing_signals") or {
+                "source": source, "ratings_used": len(rated_ids),
+                "genres_used": genres, "preferred_movie_years": preferred_years,
+            },
         })
-
-    return {"source": "deepseek", "recommendations": normalized}
+    if not normalized:
+        raise HTTPException(status_code=502,
+            detail="The recommendation service did not return valid movie titles. Please try again.")
+    return {"source": source + ("+tmdb" if settings.tmdb_access_token else ""),
+            "recommendations": normalized}
 
 def fallback_reason(movie, signals, genres):
     matched = [g for g in movie.get("genres", []) if g.lower() in {x.lower() for x in genres}]
