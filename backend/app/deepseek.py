@@ -55,6 +55,7 @@ async def recommend_movies_with_deepseek(
     favourite_titles: list[str] | None = None,
     rated_titles: list[str] | None = None,
     limit: int = 12,
+    preferred_movie_years: list[str] | None = None,
 ) -> list[dict]:
     """Emergency recommendation source used when the local movie catalogue is empty.
 
@@ -67,11 +68,19 @@ async def recommend_movies_with_deepseek(
 
     favourite_titles = favourite_titles or []
     rated_titles = rated_titles or []
+    preferred_movie_years = preferred_movie_years or []
     genre_text = ", ".join(genres) if genres else "general audience-friendly films"
+    year_labels = {
+        "before_1980": "before 1980", "1980_1999": "1980–1999",
+        "2000_2009": "2000–2009", "2010_2019": "2010–2019",
+        "2020_onwards": "2020 onwards",
+    }
+    year_text = ", ".join(year_labels[x] for x in preferred_movie_years if x in year_labels) or "no preferred release period"
 
     prompt = f"""Recommend exactly {max(1, min(limit, 12))} real movies for a user.
 
 Preferred genres: {genre_text}
+Preferred release years: {year_text}. Prioritize movies from these periods when a period is specified.
 Favourite movies already selected: {', '.join(favourite_titles) or 'none'}
 Movies already rated/seen: {', '.join(rated_titles) or 'none'}
 
